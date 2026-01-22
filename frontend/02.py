@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QLabel, QFrame, QSizePolicy, QSpacerItem, QTextEdit, QScrollArea, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QImage, QPixmap, QColor, QPalette, QFont
+from PyQt6.QtGui import QImage, QPixmap, QColor, QPalette, QFont, QPainter
 try:
     import pyqtgraph as pg
     HAS_PYQTGRAPH = True
@@ -137,7 +137,15 @@ class VoiceAssistantThread(threading.Thread):
     def run(self):
         try:
             self.signals.log_message.emit("Initializing voice system...", "system")
-            self.assistant = LocalAssistant()
+            self.assistant = LocalAssistant(signals=self.signals)  # Pass signals to assistant
+            
+            # Authenticate user on startup - allows secondary users to log in
+            authenticated, user_name = self.assistant.authenticate_on_startup()
+            
+            if authenticated:
+                self.signals.log_message.emit(f"Access Granted! User: {user_name}", "system")
+            else:
+                self.signals.log_message.emit("Authentication timeout. Using default access.", "system")
             self.assistant_ref = self.assistant  # Store reference for interruption
             self.signals.log_message.emit("System online. Ready for commands.", "system")
             
@@ -155,7 +163,12 @@ class VoiceAssistantThread(threading.Thread):
             time.sleep(0.6)
             
             while self.running:
-                self.signals.log_message.emit("Listening...", "status")
+                # Check if currently speaking and show appropriate listening message
+                if self.assistant.is_speaking:
+                    self.signals.log_message.emit("Listening for wake word to interrupt...", "status")
+                else:
+                    self.signals.log_message.emit("Listening...", "status")
+                    
                 # If somehow still speaking, wait a bit before listening
                 while self.assistant.is_speaking and self.running:
                     time.sleep(0.2)
@@ -175,21 +188,29 @@ class VoiceAssistantThread(threading.Thread):
                         self.assistant.speak("Shutting down. Goodbye!")
                         break
                     
-                    # Extract command type first
-                    response, command_type = self.assistant.process_command(query)
-                    task_title = self.get_task_type_title(command_type)
-                    
-                    # Emit task update with short title
-                    self.signals.task_update.emit("active", task_title)
-                    self.signals.log_message.emit("Processing...", "status")
-                    
-                    # Speak response while listening for interruption
-                    completed = self._speak_with_interruption(response)
-                    
-                    # Only mark done and log if speech completed (not interrupted)
-                    if completed:
-                        self.signals.task_update.emit("done", task_title)
-                        self.signals.log_message.emit(response, "jarvis")
+                    try:
+                        # Extract command type first
+                        response, command_type = self.assistant.process_command(query)
+                        print(f"\n[DEBUG] Response: {response}")
+                        print(f"[DEBUG] Command type: {command_type}")
+                        
+                        task_title = self.get_task_type_title(command_type)
+                        
+                        # Emit task update with short title
+                        self.signals.task_update.emit("active", task_title)
+                        self.signals.log_message.emit("Processing...", "status")
+                        
+                        # Speak response (assistant.speak() already emits to frontend)
+                        completed = self._speak_with_interruption(response)
+                        
+                        # Only mark done if speech completed (not interrupted)
+                        if completed:
+                            self.signals.task_update.emit("done", task_title)
+                        # Don't emit again - speak() already did it
+                    except Exception as cmd_error:
+                        error_msg = f"Command error: {str(cmd_error)}"
+                        print(f"[ERROR] {error_msg}")
+                        self.signals.log_message.emit(error_msg, "error")
         
         except Exception as e:
             self.signals.log_message.emit(f"Error: {str(e)}", "error")
@@ -467,6 +488,7 @@ class MainWindow(QMainWindow):
         self.voice_signals.log_message.connect(self.handle_voice_message)
         self.voice_signals.task_update.connect(self.handle_task_update)
         self.voice_thread = None
+        self.voice_assistant = None  # Will store reference to assistant
         
         # Terminal message
         self.append_terminal("Waiting for face authentication...", "system")
@@ -493,49 +515,89 @@ class MainWindow(QMainWindow):
         return sep
 
     def update_frame(self):
+        # Check if voice assistant camera is active
+        if self.voice_assistant and hasattr(self.voice_assistant, 'camera_active') and self.voice_assistant.camera_active:
+            # Show voice assistant camera feed
+            if self.voice_assistant.camera and self.voice_assistant.camera.is_opened():
+                frame = self.voice_assistant.camera.get_frame()
+                if frame is not None:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Display frame
+                    h, w, ch = frame_rgb.shape
+                    bytes_per_line = ch * w
+                    image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+
+                    pixmap = QPixmap.fromImage(image)
+                    scaled = pixmap.scaled(
+                        self.camera_label.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    )
+
+                    self.camera_label.setPixmap(scaled)
+                    self.camera_label.setText("")
+                    self.status_label.setText("Camera Active")
+                    self.status_label.setStyleSheet("color: #00ff88; font-size: 13px; font-weight: bold;")
+                    return
+        
+        # Only update if face recognition is active (before authentication)
+        if not self.face_recognition_active or self.is_authenticated:
+            # Camera off - show gray screen
+            if not hasattr(self, '_camera_off_pixmap'):
+                pixmap = QPixmap(self.camera_label.size())
+                pixmap.fill(QColor("#1a1a1a"))  # Dark gray background
+                painter = QPainter(pixmap)
+                painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+                painter.setPen(QColor("#666666"))  # Gray text
+                painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "📷 Camera OFF")
+                painter.end()
+                self._camera_off_pixmap = pixmap
+            
+            self.camera_label.setPixmap(self._camera_off_pixmap)
+            self.status_label.setText("Camera OFF")
+            self.status_label.setStyleSheet("color: #ff4d4d; font-size: 13px; font-weight: bold;")
+            return
+        
+        # Get frame from camera
         frame_rgb = self.camera.get_frame_rgb()
 
         if frame_rgb is not None:
-            # Only run face recognition if not authenticated yet
-            if self.face_recognition_active and not self.is_authenticated:
-                # Convert RGB to BGR for face recognition (OpenCV uses BGR)
-                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            # Convert RGB to BGR for face recognition (OpenCV uses BGR)
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            
+            # Run face recognition
+            authenticated, similarity, annotated_frame = self.face_recognizer.recognize_face(frame_bgr)
+            
+            # Convert back to RGB for display
+            frame_display = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            
+            # Update status based on authentication
+            if authenticated:
+                status_text = f"Access Granted ({similarity:.2f})"
+                status_color = "#51cf66"
                 
-                # Run face recognition
-                authenticated, similarity, annotated_frame = self.face_recognizer.recognize_face(frame_bgr)
-                
-                # Convert back to RGB for display
-                frame_display = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                
-                # Update status based on authentication
-                if authenticated:
-                    status_text = f"Access Granted ({similarity:.2f})"
-                    status_color = "#51cf66"
+                # First time authentication
+                if not self.is_authenticated:
+                    self.is_authenticated = True
+                    self.face_recognition_active = False
                     
-                    # First time authentication
-                    if not self.is_authenticated:
-                        self.is_authenticated = True
-                        self.face_recognition_active = False
-                        
-                        # Update terminal
-                        self.append_terminal(f"Access Granted! Similarity: {similarity:.2f}", "system")
-                        self.append_terminal("Starting voice assistant...", "system")
-                        
-                        # Start voice assistant
-                        self.start_voice_assistant()
-                else:
-                    if similarity > 0:
-                        status_text = f"Unknown ({similarity:.2f})"
-                        status_color = "#ff6b6b"
-                    else:
-                        status_text = "Scanning..."
-                        status_color = "#ffcc00"
-                
-                self.status_label.setText(status_text)
-                self.status_label.setStyleSheet(f"color: {status_color}; font-size: 13px; font-weight: bold;")
+                    # Update terminal
+                    self.append_terminal(f"Access Granted! Similarity: {similarity:.2f}", "system")
+                    self.append_terminal("Starting voice assistant...", "system")
+                    
+                    # Start voice assistant
+                    self.start_voice_assistant()
             else:
-                # Face recognition disabled, just display frame
-                frame_display = frame_rgb
+                if similarity > 0:
+                    status_text = f"Unknown ({similarity:.2f})"
+                    status_color = "#ff6b6b"
+                else:
+                    status_text = "Scanning..."
+                    status_color = "#ffcc00"
+            
+            self.status_label.setText(status_text)
+            self.status_label.setStyleSheet(f"color: {status_color}; font-size: 13px; font-weight: bold;")
             
             # Display frame
             h, w, ch = frame_display.shape
@@ -552,10 +614,19 @@ class MainWindow(QMainWindow):
 
             self.camera_label.setPixmap(scaled)
             self.camera_label.setText("")  # remove placeholder
-
         else:
-            self.camera_label.setText("No frame")
-            self.camera_label.setPixmap(QPixmap())
+            # No frame available - show gray screen
+            if not hasattr(self, '_camera_off_pixmap'):
+                pixmap = QPixmap(self.camera_label.size())
+                pixmap.fill(QColor("#1a1a1a"))  # Dark gray background
+                painter = QPainter(pixmap)
+                painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+                painter.setPen(QColor("#666666"))  # Gray text
+                painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "📷 Camera OFF")
+                painter.end()
+                self._camera_off_pixmap = pixmap
+            
+            self.camera_label.setPixmap(self._camera_off_pixmap)
     
     def start_voice_assistant(self):
         """Start the voice assistant after authentication"""
@@ -572,6 +643,12 @@ class MainWindow(QMainWindow):
             # Start voice thread
             self.voice_thread = VoiceAssistantThread(self.voice_signals)
             self.voice_thread.start()
+            
+            # Wait briefly for assistant to initialize, then store reference
+            import time
+            time.sleep(0.5)
+            if self.voice_thread and hasattr(self.voice_thread, 'assistant'):
+                self.voice_assistant = self.voice_thread.assistant
             
             # Update status
             self.status_label.setText("Voice Assistant Active")

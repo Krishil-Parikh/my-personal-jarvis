@@ -77,7 +77,7 @@ class CameraCapture:
                     self.frame_queue.append(frame.copy())
 
             else:
-                print("[Camera] WARNING: cap.read() failed")
+                # Silent fail - don't spam warnings
                 time.sleep(0.1)  # avoid CPU spin
 
             time.sleep(0.033)  # ~30 fps cap

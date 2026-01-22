@@ -1,6 +1,10 @@
 import requests
 import json
 import os
+import asyncio
+import base64
+import cv2
+import numpy as np
 
 class AIAssistant:
     def __init__(self, api_key=None):
@@ -10,9 +14,12 @@ class AIAssistant:
         Args:
             api_key: OpenRouter API key (can also be set via OPENROUTER_API_KEY env variable)
         """
-        self.api_key = api_key or os.getenv('OPENROUTER_API_KEY')
+        self.api_key = api_key or os.getenv('OPENROUTER_API_KEY','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')
         self.api_url = "https://openrouter.ai/api/v1/chat/completions"
         self.model = "mistralai/mistral-7b-instruct"
+        self.vision_model = "qwen/qwen-2.5-vl-7b-instruct:free"  # Free vision model
+        self.site_url = os.getenv('SITE_URL', 'http://localhost:5000')
+        self.site_name = os.getenv('SITE_NAME', 'Personal-Jarvis')
         
         if not self.api_key:
             print("Warning: No OpenRouter API key provided. Set OPENROUTER_API_KEY environment variable.")
@@ -259,3 +266,169 @@ class AIAssistant:
         except Exception as e:
             print(f"Error answering with web context: {e}")
             return "I encountered an error while processing the search results."
+    async def answer_with_intelligent_search(self, query: str, force_browser=False):
+        """
+        Answer a query using the intelligent web search system.
+        This method integrates with the new intelligent_web_search module.
+        """
+        try:
+            # Import here to avoid circular dependency
+            from .intelligent_web_search import IntelligentWebSearch
+            
+            # Initialize search system
+            search_system = IntelligentWebSearch(show_browser=force_browser)
+            
+            # Perform intelligent search
+            search_results = await search_system.search(query, force_browser=force_browser)
+            
+            # Generate answer using the search results
+            answer = search_system.generate_answer(query, search_results)
+            
+            return {
+                'answer': answer,
+                'search_results': search_results,
+                'sources': [r.get('url') for r in search_results.get('results', [])[:5]]
+            }
+            
+        except Exception as e:
+            print(f"Error in intelligent search: {e}")
+            return {
+                'answer': f"I encountered an error while searching: {str(e)}",
+                'search_results': None,
+                'sources': []
+            }
+
+    def analyze_image(self, image, query="What do you see in this image?", detail="high"):
+        """
+        Analyze an image using Vision Language Model
+        
+        Args:
+            image: Either a file path (str), numpy array (cv2 frame), or PIL Image
+            query: Question about the image
+            detail: 'low' or 'high' - quality of image analysis
+        
+        Returns:
+            str: AI's description/analysis of the image
+        """
+        if not self.api_key:
+            return "API key not configured."
+        
+        try:
+            # Convert image to base64
+            if isinstance(image, str):
+                # File path
+                with open(image, "rb") as img_file:
+                    image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+            elif isinstance(image, np.ndarray):
+                # OpenCV/numpy array (BGR format)
+                # Encode as JPEG
+                success, buffer = cv2.imencode('.jpg', image)
+                if not success:
+                    return "Failed to encode image"
+                image_base64 = base64.b64encode(buffer).decode('utf-8')
+            else:
+                return "Unsupported image format"
+            
+            # Build message with image
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": query
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}",
+                                "detail": detail
+                            }
+                        }
+                    ]
+                }
+            ]
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": self.site_url,
+                "X-Title": self.site_name
+            }
+            
+            payload = {
+                "model": self.vision_model,
+                "messages": messages,
+                "max_tokens": 500,
+                "temperature": 0.7
+            }
+            
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            return result['choices'][0]['message']['content']
+        
+        except Exception as e:
+            print(f"Error in image analysis: {e}")
+            return f"I encountered an error analyzing the image: {str(e)}"
+
+    def analyze_camera_feed(self, frame, query="What do you see?"):
+        """
+        Analyze a camera frame with a specific query
+        
+        Args:
+            frame: OpenCV frame (numpy array)
+            query: User's question about what they're seeing
+        
+        Returns:
+            str: AI's answer about the camera view
+        """
+        return self.analyze_image(frame, query, detail="high")
+
+    def process_query(self, query: str, conversation_history=None):
+        """
+        Process a user query with automatic web search integration.
+        
+        This is the main entry point that:
+        1. First tries to answer with existing knowledge
+        2. If [NEEDS_WEB_SEARCH] is returned, performs intelligent web search
+        3. Returns the final answer with sources
+        """
+        # First try without web search
+        initial_response = self.generate_response(
+            query,
+            conversation_history=conversation_history,
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        # Check if web search is needed
+        if self.needs_web_search(initial_response):
+            print("🔍 Web search triggered by AI")
+            
+            # Perform intelligent web search (synchronously)
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            result = loop.run_until_complete(
+                self.answer_with_intelligent_search(query)
+            )
+            
+            return result
+        
+        # Return initial response if no web search needed
+        return {
+            'answer': initial_response,
+            'search_results': None,
+            'sources': []
+        }

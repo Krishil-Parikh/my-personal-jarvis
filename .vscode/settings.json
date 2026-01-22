@@ -1,5 +1,6 @@
 {
     "chat.tools.terminal.autoApprove": {
-        "&\\\\s\\\"\\\\']&))'": true
+        "&\\\\s\\\"\\\\']&))'": true,
+        ".venv\\Scripts\\activate": true
     }
 }

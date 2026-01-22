@@ -4,6 +4,7 @@ requests
 beautifulsoup4
 googlesearch-python
 ddgs
+duckduckgo-search
 chromadb
 azure-cognitiveservices-speech
 python-dotenv
@@ -17,3 +18,10 @@ PyQt6
 pillow
 pyqtgraph
 psutil
+
+# Web scraping and automation
+playwright
+lxml
+
+# Async support
+asyncio
